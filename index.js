@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -66,6 +67,24 @@ function shuffleArray(items) {
   return cloned;
 }
 
+function shuffleQuestionOptions(question) {
+  const optionsWithIndex = question.options.map((option, index) => ({
+    option,
+    originalIndex: index,
+  }));
+
+  const shuffledOptions = shuffleArray(optionsWithIndex);
+  const nextCorrectIndex = shuffledOptions.findIndex(
+    (entry) => entry.originalIndex === question.correctIndex
+  );
+
+  return {
+    ...question,
+    options: shuffledOptions.map((entry) => entry.option),
+    correctIndex: nextCorrectIndex,
+  };
+}
+
 function sortPlayers(players) {
   return [...players].sort((a, b) => b.score - a.score);
 }
@@ -131,10 +150,10 @@ function buildQuestionPool(room) {
     selectedCategories.includes(question.category)
   );
 
-  const shuffled = shuffleArray(filtered);
-  const desiredCount = Math.min(room.settings.totalQuestions, shuffled.length);
+  const shuffledQuestions = shuffleArray(filtered).map(shuffleQuestionOptions);
+  const desiredCount = Math.min(room.settings.totalQuestions, shuffledQuestions.length);
 
-  return shuffled.slice(0, desiredCount);
+  return shuffledQuestions.slice(0, desiredCount);
 }
 
 function getCurrentQuestion(room) {
