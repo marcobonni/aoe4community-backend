@@ -179,6 +179,40 @@ function getRoundResults(room) {
   );
 }
 
+function getFinalResults(room) {
+  return sortPlayers(room.players).map((player) => {
+    const stats = room.playerStats[player.id] || {
+      correctAnswers: 0,
+      wrongAnswers: 0,
+      answeredQuestions: 0,
+      totalPointsEarned: 0,
+      totalResponseTimeMs: 0,
+      rounds: [],
+    };
+
+    const avgResponseTimeMs =
+      stats.answeredQuestions > 0
+        ? Math.round(stats.totalResponseTimeMs / stats.answeredQuestions)
+        : 0;
+
+    return {
+      playerId: player.id,
+      playerName: player.name,
+      finalScore: player.score,
+      correctAnswers: stats.correctAnswers,
+      wrongAnswers: stats.wrongAnswers,
+      answeredQuestions: stats.answeredQuestions,
+      accuracy:
+        stats.answeredQuestions > 0
+          ? Math.round((stats.correctAnswers / stats.answeredQuestions) * 100)
+          : 0,
+      totalPointsEarned: stats.totalPointsEarned,
+      avgResponseTimeMs,
+      rounds: stats.rounds,
+    };
+  });
+}
+
 function finishGame(code) {
   const room = rooms[code];
   if (!room) return;
@@ -189,6 +223,7 @@ function finishGame(code) {
   io.to(code).emit("game:finished", {
     room: sanitizeRoom(room),
     players: sortPlayers(room.players).map(sanitizePlayer),
+    finalResults: getFinalResults(room),
   });
 
   emitRoomUpdate(code);
@@ -304,6 +339,7 @@ function resetRoomForNewGame(room) {
   room.gameQuestions = [];
   room.currentAnswers = {};
   room.currentRoundResults = {};
+  room.playerStats = {};
 
   room.players.forEach((player) => {
     player.score = 0;
@@ -385,6 +421,7 @@ io.on("connection", (socket) => {
       gameQuestions: [],
       currentAnswers: {},
       currentRoundResults: {},
+      playerStats: {},
       settings: {
         categories,
         totalQuestions,
@@ -500,9 +537,19 @@ io.on("connection", (socket) => {
     }
 
     room.currentQuestionIndex = 0;
+    room.playerStats = {};
+
     room.players.forEach((entry) => {
       entry.score = 0;
       entry.answered = false;
+      room.playerStats[entry.id] = {
+        correctAnswers: 0,
+        wrongAnswers: 0,
+        answeredQuestions: 0,
+        totalPointsEarned: 0,
+        totalResponseTimeMs: 0,
+        rounds: [],
+      };
     });
 
     room.gameQuestions = buildQuestionPool(room);
@@ -601,6 +648,37 @@ io.on("connection", (socket) => {
       pointsEarned,
       totalScore: player.score,
     };
+
+    if (!room.playerStats[player.id]) {
+      room.playerStats[player.id] = {
+        correctAnswers: 0,
+        wrongAnswers: 0,
+        answeredQuestions: 0,
+        totalPointsEarned: 0,
+        totalResponseTimeMs: 0,
+        rounds: [],
+      };
+    }
+
+    room.playerStats[player.id].answeredQuestions += 1;
+    room.playerStats[player.id].totalPointsEarned += pointsEarned;
+    room.playerStats[player.id].totalResponseTimeMs += elapsed;
+
+    if (isCorrect) {
+      room.playerStats[player.id].correctAnswers += 1;
+    } else {
+      room.playerStats[player.id].wrongAnswers += 1;
+    }
+
+    room.playerStats[player.id].rounds.push({
+      questionText: question.text,
+      category: question.category,
+      difficulty: question.difficulty,
+      selectedAnswer: question.options[answerIndex],
+      correctAnswer: question.options[question.correctIndex],
+      isCorrect,
+      pointsEarned,
+    });
 
     callback?.({
       ok: true,
