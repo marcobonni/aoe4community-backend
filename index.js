@@ -1,4 +1,3 @@
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -10,6 +9,8 @@ const DIFFICULTY_MULTIPLIERS = {
   medium: 1.5,
   hard: 2,
 };
+
+const REVEAL_DURATION_MS = 4000;
 
 const app = express();
 app.use(cors());
@@ -160,6 +161,24 @@ function getCurrentQuestion(room) {
   return room.gameQuestions[room.currentQuestionIndex] || null;
 }
 
+function getAnswerMarkers(room) {
+  return Object.entries(room.currentAnswers || {}).map(([playerId, answerIndex]) => {
+    const player = room.players.find((entry) => entry.id === playerId);
+
+    return {
+      playerId,
+      playerName: player?.name ?? "Giocatore",
+      answerIndex,
+    };
+  });
+}
+
+function getRoundResults(room) {
+  return Object.values(room.currentRoundResults || {}).sort(
+    (a, b) => b.totalScore - a.totalScore
+  );
+}
+
 function finishGame(code) {
   const room = rooms[code];
   if (!room) return;
@@ -188,8 +207,10 @@ function revealAnswer(code) {
   }
 
   const difficultyMultiplier = getDifficultyMultiplier(question.difficulty);
+  const revealStartedAt = Date.now();
 
   room.state = "reveal";
+  room.revealStartedAt = revealStartedAt;
 
   io.to(code).emit("game:reveal", {
     room: sanitizeRoom(room),
@@ -205,6 +226,10 @@ function revealAnswer(code) {
     correctIndex: question.correctIndex,
     correctAnswer: question.options[question.correctIndex],
     players: sortPlayers(room.players).map(sanitizePlayer),
+    answerMarkers: getAnswerMarkers(room),
+    roundResults: getRoundResults(room),
+    revealStartedAt,
+    revealDurationMs: REVEAL_DURATION_MS,
   });
 
   emitRoomUpdate(code);
@@ -218,7 +243,7 @@ function revealAnswer(code) {
     }
 
     startQuestion(code);
-  }, 3000);
+  }, REVEAL_DURATION_MS);
 }
 
 function startQuestion(code) {
@@ -237,7 +262,10 @@ function startQuestion(code) {
 
   room.state = "question";
   room.roundStartedAt = Date.now();
+  room.revealStartedAt = null;
   room.doublePoints = Math.random() < 0.25;
+  room.currentAnswers = {};
+  room.currentRoundResults = {};
 
   room.players.forEach((player) => {
     player.answered = false;
@@ -256,6 +284,7 @@ function startQuestion(code) {
     startedAt: room.roundStartedAt,
     doublePoints: room.doublePoints,
     difficultyMultiplier,
+    answerMarkers: [],
   });
 
   emitRoomUpdate(code);
@@ -270,8 +299,11 @@ function resetRoomForNewGame(room) {
   room.state = "lobby";
   room.currentQuestionIndex = 0;
   room.roundStartedAt = null;
+  room.revealStartedAt = null;
   room.doublePoints = false;
   room.gameQuestions = [];
+  room.currentAnswers = {};
+  room.currentRoundResults = {};
 
   room.players.forEach((player) => {
     player.score = 0;
@@ -346,10 +378,13 @@ io.on("connection", (socket) => {
       state: "lobby",
       currentQuestionIndex: 0,
       roundStartedAt: null,
+      revealStartedAt: null,
       questionTimeout: null,
       revealTimeout: null,
       doublePoints: false,
       gameQuestions: [],
+      currentAnswers: {},
+      currentRoundResults: {},
       settings: {
         categories,
         totalQuestions,
@@ -541,26 +576,40 @@ io.on("connection", (socket) => {
     }
 
     player.answered = true;
+    room.currentAnswers[player.id] = answerIndex;
 
     const elapsed = Date.now() - room.roundStartedAt;
     const isCorrect = Number(answerIndex) === question.correctIndex;
+
+    let pointsEarned = 0;
 
     if (isCorrect) {
       const speedBonus = Math.max(0, 50 - Math.floor(elapsed / 150));
       const baseScore = 50 + speedBonus;
       const difficultyMultiplier = getDifficultyMultiplier(question.difficulty);
       const scoreWithDifficulty = Math.round(baseScore * difficultyMultiplier);
-      const finalScore = room.doublePoints
-        ? scoreWithDifficulty * 2
-        : scoreWithDifficulty;
-
-      player.score += finalScore;
+      pointsEarned = room.doublePoints ? scoreWithDifficulty * 2 : scoreWithDifficulty;
+      player.score += pointsEarned;
     }
+
+    room.currentRoundResults[player.id] = {
+      playerId: player.id,
+      playerName: player.name,
+      answerIndex,
+      selectedAnswer: question.options[answerIndex],
+      isCorrect,
+      pointsEarned,
+      totalScore: player.score,
+    };
 
     callback?.({
       ok: true,
       isCorrect,
       correctIndex: question.correctIndex,
+    });
+
+    io.to(roomCode).emit("answers:updated", {
+      answerMarkers: getAnswerMarkers(room),
     });
 
     io.to(roomCode).emit("scoreboard:updated", {
