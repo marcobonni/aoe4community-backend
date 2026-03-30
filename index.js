@@ -2,6 +2,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const matchmakingRouter = require("./routes/matchmaking");
 const { QUESTIONS, QUESTION_CATEGORIES } = require("./questions");
 
 const DIFFICULTY_MULTIPLIERS = {
@@ -13,7 +14,19 @@ const DIFFICULTY_MULTIPLIERS = {
 const REVEAL_DURATION_MS = 4000;
 
 const app = express();
-app.use(cors());
+
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "https://epicojackalaoe4community.vercel.app",
+      "https://aoe4community.vercel.app",
+    ],
+    credentials: true,
+  })
+);
+
+app.use(express.json());
 
 app.get("/", (_req, res) => {
   res.send("Beasty server awake");
@@ -32,6 +45,8 @@ app.get("/meta", (_req, res) => {
   });
 });
 
+app.use("/matchmaking", matchmakingRouter);
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -41,6 +56,7 @@ const io = new Server(server, {
       "https://epicojackalaoe4community.vercel.app",
       "https://aoe4community.vercel.app",
     ],
+    credentials: true,
   },
 });
 
@@ -152,7 +168,10 @@ function buildQuestionPool(room) {
   );
 
   const shuffledQuestions = shuffleArray(filtered).map(shuffleQuestionOptions);
-  const desiredCount = Math.min(room.settings.totalQuestions, shuffledQuestions.length);
+  const desiredCount = Math.min(
+    room.settings.totalQuestions,
+    shuffledQuestions.length
+  );
 
   return shuffledQuestions.slice(0, desiredCount);
 }
