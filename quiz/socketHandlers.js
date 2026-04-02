@@ -22,6 +22,16 @@ const {
 } = require("./timerUtils");
 const { createGameFlow } = require("./gameFlow");
 
+function createChatMessage(player, text) {
+  return {
+    id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    playerId: player.id,
+    playerName: player.name,
+    text,
+    createdAt: Date.now(),
+  };
+}
+
 function registerQuizHandlers(socket, context) {
   const {
     io,
@@ -85,6 +95,7 @@ function registerQuizHandlers(socket, context) {
       currentAnswers: {},
       currentRoundResults: {},
       playerStats: {},
+      chatMessages: [],
       isPaused: false,
       isResumeCountingDown: false,
       pausedAt: null,
@@ -100,6 +111,10 @@ function registerQuizHandlers(socket, context) {
 
     callback?.({ ok: true, room: gameFlow.sanitizeRoom(room) });
     gameFlow.emitRoomUpdate(code);
+
+    socket.emit("chat:updated", {
+      messages: room.chatMessages,
+    });
   });
 
   socket.on("room:join", ({ code, name, playerSessionId }, callback) => {
@@ -164,6 +179,10 @@ function registerQuizHandlers(socket, context) {
         rejoined: true,
       });
       gameFlow.emitRoomUpdate(roomCode);
+
+      socket.emit("chat:updated", {
+        messages: room.chatMessages || [],
+      });
 
       if (room.state === "question") {
         const question = getCurrentQuestion(room);
@@ -260,6 +279,10 @@ function registerQuizHandlers(socket, context) {
       rejoined: false,
     });
     gameFlow.emitRoomUpdate(roomCode);
+
+    socket.emit("chat:updated", {
+      messages: room.chatMessages || [],
+    });
   });
 
   socket.on("room:update-settings", ({ code, settings }, callback) => {
@@ -652,6 +675,45 @@ function registerQuizHandlers(socket, context) {
     if (everyoneAnswered) {
       gameFlow.revealAnswer(roomCode);
     }
+  });
+
+  socket.on("chat:send", ({ code, text }, callback) => {
+    const { roomCode, room, player } = getRoomAndPlayer(
+      roomStore,
+      code,
+      socket.id
+    );
+
+    if (!room || !player) {
+      callback?.({ ok: false, error: "Stanza o giocatore non trovato." });
+      return;
+    }
+
+    const cleanedText = String(text || "").trim();
+
+    if (!cleanedText) {
+      callback?.({ ok: false, error: "Messaggio vuoto." });
+      return;
+    }
+
+    if (cleanedText.length > 250) {
+      callback?.({ ok: false, error: "Messaggio troppo lungo." });
+      return;
+    }
+
+    const message = createChatMessage(player, cleanedText);
+
+    room.chatMessages.push(message);
+
+    if (room.chatMessages.length > 100) {
+      room.chatMessages = room.chatMessages.slice(-100);
+    }
+
+    io.to(roomCode).emit("chat:updated", {
+      messages: room.chatMessages,
+    });
+
+    callback?.({ ok: true });
   });
 
   socket.on("disconnect", () => {
