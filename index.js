@@ -12,6 +12,7 @@ const DIFFICULTY_MULTIPLIERS = {
 };
 
 const REVEAL_DURATION_MS = 4000;
+const TIMER_TICK_MS = 250;
 
 const app = express();
 
@@ -116,7 +117,45 @@ function sanitizePlayer(player) {
   };
 }
 
+function getRemainingQuestionTime(room, question) {
+  if (!room || !question || !room.roundStartedAt) {
+    return question?.durationMs ?? 0;
+  }
+
+  const pausedExtraMs = room.isPaused && room.pausedAt
+    ? Date.now() - room.pausedAt
+    : 0;
+
+  const elapsed =
+    Date.now() -
+    room.roundStartedAt -
+    (room.pauseAccumulatedMs || 0) -
+    pausedExtraMs;
+
+  return Math.max(0, question.durationMs - elapsed);
+}
+
+function getRemainingRevealTime(room) {
+  if (!room || !room.revealStartedAt) {
+    return REVEAL_DURATION_MS;
+  }
+
+  const pausedExtraMs = room.isPaused && room.pausedAt
+    ? Date.now() - room.pausedAt
+    : 0;
+
+  const elapsed =
+    Date.now() -
+    room.revealStartedAt -
+    (room.pauseAccumulatedMs || 0) -
+    pausedExtraMs;
+
+  return Math.max(0, REVEAL_DURATION_MS - elapsed);
+}
+
 function sanitizeRoom(room) {
+  const currentQuestion = getCurrentQuestion(room);
+
   return {
     code: room.code,
     hostId: room.hostId,
@@ -124,6 +163,13 @@ function sanitizeRoom(room) {
     state: room.state,
     currentQuestionIndex: room.currentQuestionIndex,
     settings: room.settings,
+    isPaused: room.isPaused,
+    remainingMs:
+      room.state === "question" && currentQuestion
+        ? getRemainingQuestionTime(room, currentQuestion)
+        : room.state === "reveal"
+        ? getRemainingRevealTime(room)
+        : null,
   };
 }
 
@@ -140,6 +186,16 @@ function clearExistingTimeouts(room) {
   if (room.revealTimeout) {
     clearTimeout(room.revealTimeout);
     room.revealTimeout = null;
+  }
+
+  if (room.questionTicker) {
+    clearInterval(room.questionTicker);
+    room.questionTicker = null;
+  }
+
+  if (room.revealTicker) {
+    clearInterval(room.revealTicker);
+    room.revealTicker = null;
   }
 }
 
@@ -181,15 +237,17 @@ function getCurrentQuestion(room) {
 }
 
 function getAnswerMarkers(room) {
-  return Object.entries(room.currentAnswers || {}).map(([playerId, answerIndex]) => {
-    const player = room.players.find((entry) => entry.id === playerId);
+  return Object.entries(room.currentAnswers || {}).map(
+    ([playerId, answerIndex]) => {
+      const player = room.players.find((entry) => entry.id === playerId);
 
-    return {
-      playerId,
-      playerName: player?.name ?? "Giocatore",
-      answerIndex,
-    };
-  });
+      return {
+        playerId,
+        playerName: player?.name ?? "Giocatore",
+        answerIndex,
+      };
+    }
+  );
 }
 
 function getRoundResults(room) {
@@ -238,6 +296,9 @@ function finishGame(code) {
 
   clearExistingTimeouts(room);
   room.state = "finished";
+  room.isPaused = false;
+  room.pausedAt = null;
+  room.pauseAccumulatedMs = 0;
 
   io.to(code).emit("game:finished", {
     room: sanitizeRoom(room),
@@ -246,6 +307,57 @@ function finishGame(code) {
   });
 
   emitRoomUpdate(code);
+}
+
+function startRevealTicker(code) {
+  const room = rooms[code];
+  if (!room) return;
+
+  if (room.revealTicker) {
+    clearInterval(room.revealTicker);
+    room.revealTicker = null;
+  }
+
+  room.revealTicker = setInterval(() => {
+    const currentRoom = rooms[code];
+    if (!currentRoom) {
+      clearInterval(room.revealTicker);
+      room.revealTicker = null;
+      return;
+    }
+
+    if (currentRoom.state !== "reveal") {
+      clearInterval(currentRoom.revealTicker);
+      currentRoom.revealTicker = null;
+      return;
+    }
+
+    const remainingMs = getRemainingRevealTime(currentRoom);
+
+    io.to(code).emit("game:timer", {
+      phase: "reveal",
+      remainingMs,
+      isPaused: currentRoom.isPaused,
+    });
+
+    if (currentRoom.isPaused) {
+      return;
+    }
+
+    if (remainingMs <= 0) {
+      clearInterval(currentRoom.revealTicker);
+      currentRoom.revealTicker = null;
+
+      currentRoom.currentQuestionIndex += 1;
+
+      if (currentRoom.currentQuestionIndex >= currentRoom.gameQuestions.length) {
+        finishGame(code);
+        return;
+      }
+
+      startQuestion(code);
+    }
+  }, TIMER_TICK_MS);
 }
 
 function revealAnswer(code) {
@@ -265,6 +377,9 @@ function revealAnswer(code) {
 
   room.state = "reveal";
   room.revealStartedAt = revealStartedAt;
+  room.pauseAccumulatedMs = 0;
+  room.pausedAt = null;
+  room.isPaused = false;
 
   io.to(code).emit("game:reveal", {
     room: sanitizeRoom(room),
@@ -284,20 +399,63 @@ function revealAnswer(code) {
     roundResults: getRoundResults(room),
     revealStartedAt,
     revealDurationMs: REVEAL_DURATION_MS,
+    isPaused: room.isPaused,
+    remainingMs: REVEAL_DURATION_MS,
   });
 
   emitRoomUpdate(code);
+  startRevealTicker(code);
+}
 
-  room.revealTimeout = setTimeout(() => {
-    room.currentQuestionIndex += 1;
+function startQuestionTicker(code) {
+  const room = rooms[code];
+  if (!room) return;
 
-    if (room.currentQuestionIndex >= room.gameQuestions.length) {
+  if (room.questionTicker) {
+    clearInterval(room.questionTicker);
+    room.questionTicker = null;
+  }
+
+  room.questionTicker = setInterval(() => {
+    const currentRoom = rooms[code];
+    if (!currentRoom) {
+      clearInterval(room.questionTicker);
+      room.questionTicker = null;
+      return;
+    }
+
+    if (currentRoom.state !== "question") {
+      clearInterval(currentRoom.questionTicker);
+      currentRoom.questionTicker = null;
+      return;
+    }
+
+    const question = getCurrentQuestion(currentRoom);
+    if (!question) {
+      clearInterval(currentRoom.questionTicker);
+      currentRoom.questionTicker = null;
       finishGame(code);
       return;
     }
 
-    startQuestion(code);
-  }, REVEAL_DURATION_MS);
+    const remainingMs = getRemainingQuestionTime(currentRoom, question);
+
+    io.to(code).emit("game:timer", {
+      phase: "question",
+      remainingMs,
+      isPaused: currentRoom.isPaused,
+    });
+
+    if (currentRoom.isPaused) {
+      return;
+    }
+
+    if (remainingMs <= 0) {
+      clearInterval(currentRoom.questionTicker);
+      currentRoom.questionTicker = null;
+      revealAnswer(code);
+    }
+  }, TIMER_TICK_MS);
 }
 
 function startQuestion(code) {
@@ -320,6 +478,9 @@ function startQuestion(code) {
   room.doublePoints = Math.random() < 0.25;
   room.currentAnswers = {};
   room.currentRoundResults = {};
+  room.isPaused = false;
+  room.pausedAt = null;
+  room.pauseAccumulatedMs = 0;
 
   room.players.forEach((player) => {
     player.answered = false;
@@ -339,13 +500,12 @@ function startQuestion(code) {
     doublePoints: room.doublePoints,
     difficultyMultiplier,
     answerMarkers: [],
+    isPaused: room.isPaused,
+    remainingMs: question.durationMs,
   });
 
   emitRoomUpdate(code);
-
-  room.questionTimeout = setTimeout(() => {
-    revealAnswer(code);
-  }, question.durationMs);
+  startQuestionTicker(code);
 }
 
 function resetRoomForNewGame(room) {
@@ -359,6 +519,9 @@ function resetRoomForNewGame(room) {
   room.currentAnswers = {};
   room.currentRoundResults = {};
   room.playerStats = {};
+  room.isPaused = false;
+  room.pausedAt = null;
+  room.pauseAccumulatedMs = 0;
 
   room.players.forEach((player) => {
     player.score = 0;
@@ -373,12 +536,16 @@ function ensureValidCategories(rawCategories) {
     return validIds;
   }
 
-  const filtered = rawCategories.filter((category) => validIds.includes(category));
+  const filtered = rawCategories.filter((category) =>
+    validIds.includes(category)
+  );
   return filtered.length > 0 ? filtered : validIds;
 }
 
 function getRoomAndPlayer(code, socketId) {
-  const roomCode = String(code || "").trim().toUpperCase();
+  const roomCode = String(code || "")
+    .trim()
+    .toUpperCase();
   const room = rooms[roomCode];
 
   if (!room) {
@@ -436,11 +603,16 @@ io.on("connection", (socket) => {
       revealStartedAt: null,
       questionTimeout: null,
       revealTimeout: null,
+      questionTicker: null,
+      revealTicker: null,
       doublePoints: false,
       gameQuestions: [],
       currentAnswers: {},
       currentRoundResults: {},
       playerStats: {},
+      isPaused: false,
+      pausedAt: null,
+      pauseAccumulatedMs: 0,
       settings: {
         categories,
         totalQuestions,
@@ -454,7 +626,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("room:join", ({ code, name, playerSessionId }, callback) => {
-    const roomCode = String(code || "").trim().toUpperCase();
+    const roomCode = String(code || "")
+      .trim()
+      .toUpperCase();
     const trimmedName = String(name || "").trim();
     const trimmedSessionId = String(playerSessionId || "").trim();
     const room = rooms[roomCode];
@@ -479,20 +653,106 @@ io.on("connection", (socket) => {
     );
 
     if (existingPlayerBySession) {
+      const oldPlayerId = existingPlayerBySession.id;
       existingPlayerBySession.id = socket.id;
       existingPlayerBySession.name = trimmedName;
       existingPlayerBySession.connected = true;
 
+      if (room.hostId === oldPlayerId) {
+        room.hostId = socket.id;
+      }
+
+      if (room.currentAnswers?.[oldPlayerId] !== undefined) {
+        room.currentAnswers[socket.id] = room.currentAnswers[oldPlayerId];
+        delete room.currentAnswers[oldPlayerId];
+      }
+
+      if (room.currentRoundResults?.[oldPlayerId]) {
+        room.currentRoundResults[socket.id] = {
+          ...room.currentRoundResults[oldPlayerId],
+          playerId: socket.id,
+          playerName: trimmedName,
+        };
+        delete room.currentRoundResults[oldPlayerId];
+      }
+
+      if (room.playerStats?.[oldPlayerId]) {
+        room.playerStats[socket.id] = room.playerStats[oldPlayerId];
+        delete room.playerStats[oldPlayerId];
+      }
+
       socket.join(roomCode);
       callback?.({ ok: true, room: sanitizeRoom(room), rejoined: true });
       emitRoomUpdate(roomCode);
+
+      if (room.state === "question") {
+        const question = getCurrentQuestion(room);
+
+        if (question) {
+          socket.emit("game:question", {
+            room: sanitizeRoom(room),
+            question: {
+              id: question.id,
+              category: question.category,
+              difficulty: question.difficulty,
+              text: question.text,
+              options: question.options,
+              durationMs: question.durationMs,
+            },
+            startedAt: room.roundStartedAt,
+            doublePoints: room.doublePoints,
+            difficultyMultiplier: getDifficultyMultiplier(question.difficulty),
+            answerMarkers: getAnswerMarkers(room),
+            isPaused: room.isPaused,
+            remainingMs: getRemainingQuestionTime(room, question),
+          });
+        }
+      }
+
+      if (room.state === "reveal") {
+        const question = getCurrentQuestion(room);
+
+        if (question) {
+          socket.emit("game:reveal", {
+            room: sanitizeRoom(room),
+            question: {
+              id: question.id,
+              category: question.category,
+              difficulty: question.difficulty,
+              text: question.text,
+              options: question.options,
+              durationMs: question.durationMs,
+            },
+            difficultyMultiplier: getDifficultyMultiplier(question.difficulty),
+            correctIndex: question.correctIndex,
+            correctAnswer: question.options[question.correctIndex],
+            players: sortPlayers(room.players).map(sanitizePlayer),
+            answerMarkers: getAnswerMarkers(room),
+            roundResults: getRoundResults(room),
+            revealStartedAt: room.revealStartedAt,
+            revealDurationMs: REVEAL_DURATION_MS,
+            isPaused: room.isPaused,
+            remainingMs: getRemainingRevealTime(room),
+          });
+        }
+      }
+
+      if (room.state === "finished") {
+        socket.emit("game:finished", {
+          room: sanitizeRoom(room),
+          players: sortPlayers(room.players).map(sanitizePlayer),
+          finalResults: getFinalResults(room),
+        });
+      }
+
       return;
     }
 
     if (room.state !== "lobby") {
       callback?.({
         ok: false,
-        error: "La partita è già iniziata. Può rientrare solo chi era già dentro.",
+        error:
+          "La partita è già iniziata. Può rientrare solo chi era già dentro.",
       });
       return;
     }
@@ -521,12 +781,18 @@ io.on("connection", (socket) => {
     }
 
     if (room.hostId !== socket.id) {
-      callback?.({ ok: false, error: "Solo l'host può modificare le impostazioni." });
+      callback?.({
+        ok: false,
+        error: "Solo l'host può modificare le impostazioni.",
+      });
       return;
     }
 
     if (room.state !== "lobby") {
-      callback?.({ ok: false, error: "Le impostazioni si cambiano solo in lobby." });
+      callback?.({
+        ok: false,
+        error: "Le impostazioni si cambiano solo in lobby.",
+      });
       return;
     }
 
@@ -534,7 +800,10 @@ io.on("connection", (socket) => {
       categories: ensureValidCategories(settings?.categories),
       totalQuestions: Math.max(
         5,
-        Math.min(20, Number(settings?.totalQuestions || room.settings.totalQuestions || 10))
+        Math.min(
+          20,
+          Number(settings?.totalQuestions || room.settings.totalQuestions || 10)
+        )
       ),
     };
 
@@ -557,6 +826,9 @@ io.on("connection", (socket) => {
 
     room.currentQuestionIndex = 0;
     room.playerStats = {};
+    room.isPaused = false;
+    room.pausedAt = null;
+    room.pauseAccumulatedMs = 0;
 
     room.players.forEach((entry) => {
       entry.score = 0;
@@ -594,11 +866,93 @@ io.on("connection", (socket) => {
     }
 
     if (room.hostId !== socket.id) {
-      callback?.({ ok: false, error: "Solo l'host può avviare la rivincita." });
+      callback?.({
+        ok: false,
+        error: "Solo l'host può avviare la rivincita.",
+      });
       return;
     }
 
     resetRoomForNewGame(room);
+    emitRoomUpdate(roomCode);
+    callback?.({ ok: true });
+  });
+
+  socket.on("game:pause", ({ code }, callback) => {
+    const { roomCode, room, player } = getRoomAndPlayer(code, socket.id);
+
+    if (!room || !player) {
+      callback?.({ ok: false, error: "Stanza o giocatore non trovato." });
+      return;
+    }
+
+    if (room.hostId !== socket.id) {
+      callback?.({ ok: false, error: "Solo l'host può mettere in pausa." });
+      return;
+    }
+
+    if (room.state !== "question" && room.state !== "reveal") {
+      callback?.({
+        ok: false,
+        error: "La pausa è disponibile solo durante la partita.",
+      });
+      return;
+    }
+
+    if (room.isPaused) {
+      callback?.({ ok: false, error: "La partita è già in pausa." });
+      return;
+    }
+
+    room.isPaused = true;
+    room.pausedAt = Date.now();
+
+    io.to(roomCode).emit("game:paused", {
+      room: sanitizeRoom(room),
+      isPaused: true,
+      phase: room.state,
+      remainingMs:
+        room.state === "question"
+          ? getRemainingQuestionTime(room, getCurrentQuestion(room))
+          : getRemainingRevealTime(room),
+    });
+
+    emitRoomUpdate(roomCode);
+    callback?.({ ok: true });
+  });
+
+  socket.on("game:resume", ({ code }, callback) => {
+    const { roomCode, room, player } = getRoomAndPlayer(code, socket.id);
+
+    if (!room || !player) {
+      callback?.({ ok: false, error: "Stanza o giocatore non trovato." });
+      return;
+    }
+
+    if (room.hostId !== socket.id) {
+      callback?.({ ok: false, error: "Solo l'host può riprendere la partita." });
+      return;
+    }
+
+    if (!room.isPaused || !room.pausedAt) {
+      callback?.({ ok: false, error: "La partita non è in pausa." });
+      return;
+    }
+
+    room.pauseAccumulatedMs += Date.now() - room.pausedAt;
+    room.pausedAt = null;
+    room.isPaused = false;
+
+    io.to(roomCode).emit("game:resumed", {
+      room: sanitizeRoom(room),
+      isPaused: false,
+      phase: room.state,
+      remainingMs:
+        room.state === "question"
+          ? getRemainingQuestionTime(room, getCurrentQuestion(room))
+          : getRemainingRevealTime(room),
+    });
+
     emitRoomUpdate(roomCode);
     callback?.({ ok: true });
   });
@@ -613,6 +967,11 @@ io.on("connection", (socket) => {
 
     if (room.state !== "question") {
       callback?.({ ok: false, error: "Nessuna domanda attiva." });
+      return;
+    }
+
+    if (room.isPaused) {
+      callback?.({ ok: false, error: "La partita è in pausa." });
       return;
     }
 
@@ -644,7 +1003,10 @@ io.on("connection", (socket) => {
     player.answered = true;
     room.currentAnswers[player.id] = answerIndex;
 
-    const elapsed = Date.now() - room.roundStartedAt;
+    const elapsed = Math.max(
+      0,
+      Date.now() - room.roundStartedAt - (room.pauseAccumulatedMs || 0)
+    );
     const isCorrect = Number(answerIndex) === question.correctIndex;
 
     let pointsEarned = 0;
@@ -654,7 +1016,9 @@ io.on("connection", (socket) => {
       const baseScore = 50 + speedBonus;
       const difficultyMultiplier = getDifficultyMultiplier(question.difficulty);
       const scoreWithDifficulty = Math.round(baseScore * difficultyMultiplier);
-      pointsEarned = room.doublePoints ? scoreWithDifficulty * 2 : scoreWithDifficulty;
+      pointsEarned = room.doublePoints
+        ? scoreWithDifficulty * 2
+        : scoreWithDifficulty;
       player.score += pointsEarned;
     }
 
