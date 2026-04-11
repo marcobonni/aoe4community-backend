@@ -71,6 +71,12 @@ const MATCH_EDITABLE_STATUSES = new Set([
   "disputed",
   "admin_review",
 ]);
+const REGISTRATION_STATUSES = new Set([
+  "pending",
+  "registered",
+  "rejected",
+  "withdrawn",
+]);
 
 if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error(
@@ -515,6 +521,24 @@ async function getRegistration(tournamentId, userId) {
   return data || null;
 }
 
+async function getRegistrationById(registrationId) {
+  const { data, error } = await supabase
+    .from("tournament_registrations")
+    .select(
+      `
+      *,
+      profile:profiles!tournament_registrations_user_id_fkey (
+        id, email, display_name, discord_name, steam_name, avatar_url
+      )
+    `
+    )
+    .eq("id", registrationId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
 async function loadParticipants(tournamentId) {
   const { data, error } = await supabase
     .from("tournament_registrations")
@@ -533,6 +557,51 @@ async function loadParticipants(tournamentId) {
 
   if (error) throw error;
   return data || [];
+}
+
+async function loadAllRegistrationEntries(tournamentId) {
+  const { data, error } = await supabase
+    .from("tournament_registrations")
+    .select(
+      `
+      *,
+      profile:profiles!tournament_registrations_user_id_fkey (
+        id, email, display_name, discord_name, steam_name, avatar_url
+      )
+    `
+    )
+    .eq("tournament_id", tournamentId)
+    .order("requested_at", { ascending: true });
+
+  if (error) throw error;
+
+  const statusOrder = {
+    registered: 0,
+    pending: 1,
+    rejected: 2,
+    withdrawn: 3,
+  };
+
+  return (data || []).sort((left, right) => {
+    const statusDiff =
+      (statusOrder[left.status] ?? Number.MAX_SAFE_INTEGER) -
+      (statusOrder[right.status] ?? Number.MAX_SAFE_INTEGER);
+
+    if (statusDiff !== 0) {
+      return statusDiff;
+    }
+
+    const leftSeed = Number.isInteger(left.seed) ? left.seed : Number.MAX_SAFE_INTEGER;
+    const rightSeed = Number.isInteger(right.seed) ? right.seed : Number.MAX_SAFE_INTEGER;
+
+    if (leftSeed !== rightSeed) {
+      return leftSeed - rightSeed;
+    }
+
+    return String(left.profile?.display_name || "").localeCompare(
+      String(right.profile?.display_name || "")
+    );
+  });
 }
 
 async function loadMatches(tournamentId) {
@@ -594,6 +663,29 @@ async function getMatchCount(tournamentId) {
 
   if (error) throw error;
   return count || 0;
+}
+
+function parseOptionalSeed(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 4096) {
+    throw new Error("seed must be a positive integer");
+  }
+
+  return parsed;
+}
+
+async function tournamentHasGeneratedBracket(tournamentId, tournament = null) {
+  if (tournament?.bracket_generated_at) {
+    return true;
+  }
+
+  const matchCount = await getMatchCount(tournamentId);
+  return matchCount > 0;
 }
 
 async function enrichTournament(tournament, userId) {
@@ -990,10 +1082,12 @@ async function loadAdminTournaments(userId) {
     tournaments.map(async (tournament) => {
       const enriched = await enrichTournament(normalizeTournament(tournament), userId);
       const pendingEntries = await getPendingRegistrationEntries(tournament.id);
+      const participantEntries = await loadAllRegistrationEntries(tournament.id);
 
       return {
         ...enriched,
         pending_registration_entries: pendingEntries,
+        participant_entries: participantEntries,
       };
     })
   );
@@ -1753,6 +1847,135 @@ router.post("/admin/approve-registration", requireAdmin, async (req, res) => {
   } catch (error) {
     console.error("POST /admin/approve-registration error:", error);
     return res.status(500).json({ error: error.message || "Failed to approve registration" });
+  }
+});
+
+router.post("/admin/update-participant", requireAdmin, async (req, res) => {
+  try {
+    const registrationId = optionalText(req.body.registration_id, 120);
+
+    if (!registrationId) {
+      return res.status(400).json({ error: "registration_id is required" });
+    }
+
+    const existingRegistration = await getRegistrationById(registrationId);
+
+    if (!existingRegistration) {
+      return res.status(404).json({ error: "Registration not found" });
+    }
+
+    const tournament = await getTournamentById(existingRegistration.tournament_id);
+
+    if (!tournament) {
+      return res.status(404).json({ error: "Tournament not found" });
+    }
+
+    const nextStatus = parseEnum(req.body.status, REGISTRATION_STATUSES, {
+      name: "status",
+      fallback: existingRegistration.status,
+    });
+    const nextSeed = parseOptionalSeed(req.body.seed);
+    const hasBracket = await tournamentHasGeneratedBracket(tournament.id, tournament);
+    const rosterChanged =
+      nextStatus !== existingRegistration.status || nextSeed !== existingRegistration.seed;
+
+    if (hasBracket && rosterChanged) {
+      return res.status(409).json({
+        error:
+          "Roster and seeding changes are blocked after bracket generation. Pause or rebuild the bracket first.",
+      });
+    }
+
+    if (nextStatus === "registered" && existingRegistration.status !== "registered") {
+      const participantCount = await getRegistrationCount(tournament.id, ["registered"]);
+
+      if (participantCount >= tournament.max_participants) {
+        return res.status(400).json({ error: "Tournament is full" });
+      }
+    }
+
+    const approvedAt =
+      nextStatus === "registered"
+        ? existingRegistration.approved_at || new Date().toISOString()
+        : null;
+    const approvedByProfileId =
+      nextStatus === "registered" ? existingRegistration.approved_by_profile_id || req.user?.id || null : null;
+
+    const { data, error } = await supabase
+      .from("tournament_registrations")
+      .update({
+        status: nextStatus,
+        seed: nextSeed,
+        approved_at: approvedAt,
+        approved_by_profile_id: approvedByProfileId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", registrationId)
+      .select(
+        `
+        *,
+        profile:profiles!tournament_registrations_user_id_fkey (
+          id, email, display_name, discord_name, steam_name, avatar_url
+        )
+      `
+      )
+      .maybeSingle();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      registration: data,
+    });
+  } catch (error) {
+    console.error("POST /admin/update-participant error:", error);
+    return res.status(500).json({ error: error.message || "Failed to update participant" });
+  }
+});
+
+router.post("/admin/remove-participant", requireAdmin, async (req, res) => {
+  try {
+    const registrationId = optionalText(req.body.registration_id, 120);
+
+    if (!registrationId) {
+      return res.status(400).json({ error: "registration_id is required" });
+    }
+
+    const existingRegistration = await getRegistrationById(registrationId);
+
+    if (!existingRegistration) {
+      return res.status(404).json({ error: "Registration not found" });
+    }
+
+    const tournament = await getTournamentById(existingRegistration.tournament_id);
+
+    if (!tournament) {
+      return res.status(404).json({ error: "Tournament not found" });
+    }
+
+    const hasBracket = await tournamentHasGeneratedBracket(tournament.id, tournament);
+
+    if (hasBracket) {
+      return res.status(409).json({
+        error:
+          "Participants cannot be removed after bracket generation. Reset the bracket before editing the roster.",
+      });
+    }
+
+    const { error } = await supabase
+      .from("tournament_registrations")
+      .delete()
+      .eq("id", registrationId);
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      removed_registration_id: registrationId,
+    });
+  } catch (error) {
+    console.error("POST /admin/remove-participant error:", error);
+    return res.status(500).json({ error: error.message || "Failed to remove participant" });
   }
 });
 
