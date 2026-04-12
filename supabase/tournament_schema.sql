@@ -4,11 +4,13 @@ create table if not exists public.profiles (
   id uuid primary key default gen_random_uuid(),
   email text unique,
   display_name text not null,
+  role text not null default 'user',
   discord_name text,
   steam_name text,
   avatar_url text,
   created_at timestamptz not null default timezone('utc', now()),
-  updated_at timestamptz not null default timezone('utc', now())
+  updated_at timestamptz not null default timezone('utc', now()),
+  constraint profiles_role_check check (role in ('user', 'admin'))
 );
 
 create table if not exists public.tournaments (
@@ -16,6 +18,7 @@ create table if not exists public.tournaments (
   title text not null,
   slug text not null unique,
   description text not null default '',
+  banner_url text,
   status text not null default 'draft',
   format text not null default 'single_elimination',
   participant_mode text not null default '1v1',
@@ -99,3 +102,12 @@ create index if not exists idx_tournament_matches_tournament
 
 create index if not exists idx_tournament_matches_players
   on public.tournament_matches (player1_id, player2_id);
+
+alter table public.profiles
+add column if not exists role text not null default 'user';
+
+alter table public.profiles
+drop constraint if exists profiles_role_check;
+
+alter table public.profiles
+add constraint profiles_role_check check (role in ('user', 'admin'));
